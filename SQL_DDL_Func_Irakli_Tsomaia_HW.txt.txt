@@ -1,0 +1,174 @@
+#1. What operations do the following functions perform:
+film_in_stock: Returns a set of inventory_ids for a film at a store that are currently available for rent. It takes inputs: (p_film_id integer, p_store_id integer, OUT p_film_count integer) and returns inventory ids.
+film_not_in_stock: Returns a set of inventory_ids for a film at a store that are currently rented out.
+inventory_in_stock: Function checks to determine if a specific physical copy of a movie is currently on the shelf.
+get_customer_balance: This function calculates how much a customer owes as of a specific date (p_effective_date).
+inventory_held_by_customer: A function to find out who currently has a specific item.
+rewards_report: Generates a list of "VIP" customers based on their activity over a specific period (set in the code as roughly 3 months ago).
+last_day: It finds the first day of the next month and subtracts one day. It handles the December-to-January transition by incrementing the year.
+
+#2. Why does ‘rewards_report’ function return 0 rows? Correct and recreate the function.
+Answer: function looks back in time over hard coded period (3 months) and takes starting point as current date. Since there is no data for January 2026 (current date - 3 months) function returns empty table.
+In order to fix this we can either hardcode different period and/or different starting point or (better alternative) use dynamic query in order to get the last date in records. New query:
+CREATE OR REPLACE FUNCTION public.rewards_report1(min_monthly_purchases integer, min_dollar_amount_purchased numeric)
+ RETURNS SETOF customer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+AS $function$
+DECLARE
+    last_month_start DATE;
+    last_month_end DATE;
+    v_max_date DATE;
+    rr RECORD;
+    tmpSQL TEXT;
+BEGIN
+
+    /* 1. Sanity checks */
+    IF min_monthly_purchases = 0 THEN
+        RAISE EXCEPTION 'Minimum monthly purchases parameter must be > 0';
+    END IF;
+    IF min_dollar_amount_purchased = 0.00 THEN
+        RAISE EXCEPTION 'Minimum monthly dollar amount purchased parameter must be > $0.00';
+    END IF;
+
+    /* 2. Find the most recent activity in the database */
+    SELECT MAX(payment_date)::DATE INTO v_max_date FROM payment;
+
+    -- If the table is empty, we can't run the report
+    IF v_max_date IS NULL THEN
+        RETURN;
+    END IF;
+
+    /* 3. Set the report window to the month of the latest record 
+       (e.g., if max date is March 15, we look at March 1 - March 31) */
+    last_month_start := date_trunc('month', v_max_date)::DATE;
+    last_month_end   := (date_trunc('month', v_max_date) + INTERVAL '1 month - 1 day')::DATE;
+
+    -- Helpful for debugging in the console
+    RAISE NOTICE 'Running report for the period: % to %', last_month_start, last_month_end;
+
+    /* 4. Create a temporary storage area for Customer IDs */
+    -- We use DROP TABLE IF EXISTS to prevent errors if a previous session crashed
+    DROP TABLE IF EXISTS tmpCustomer;
+    CREATE TEMPORARY TABLE tmpCustomer (customer_id INTEGER NOT NULL PRIMARY KEY);
+
+    /* 5. Find all customers meeting the requirements */
+    tmpSQL := 'INSERT INTO tmpCustomer (customer_id)
+        SELECT p.customer_id
+        FROM payment AS p
+        WHERE p.payment_date::DATE BETWEEN '|| quote_literal(last_month_start) ||' AND '|| quote_literal(last_month_end) || '
+        GROUP BY customer_id
+        HAVING SUM(p.amount) > '|| min_dollar_amount_purchased || '
+        AND COUNT(customer_id) > ' || min_monthly_purchases ;
+
+    EXECUTE tmpSQL;
+
+    /* 6. Output matching rewardees */
+    FOR rr IN EXECUTE 'SELECT c.* FROM tmpCustomer AS t INNER JOIN customer AS c ON t.customer_id = c.customer_id' LOOP
+        RETURN NEXT rr;
+    END LOOP;
+
+    /* 7. Clean up */
+    DROP TABLE tmpCustomer;
+
+RETURN;
+END
+$function$;
+
+
+#3. Is there any function that can potentially be removed from the dvd_rental codebase (inefficient? redundant)?
+rewards_report function is redundant. It has hardcoded values that make it useless for given database.
+Also last_day is redundant because it uses operator(pg_catalog.||) and CASE WHEN logic and can be substituted for data_trunc and interval commands.
+
+#4. Which functions violate best practices? 
+As mentioned before last_day is redundant because it uses operator(pg_catalog.||) and CASE WHEN logic. date_trunc and INTERVAL should be used instead.
+inventory_in_stock performs two scans on massive table. First scan: SELECT count(*) to see if any rentals exist.
+Second scan: SELECT count(rental_id) with a LEFT JOIN. Since we need only most recent data we can use ORDER BY rental_date DESC LIMIT 1.
+rewards_report builds a query string (tmpSQL) and uses EXECUTE. This is security risk since it makes database vulnerable to SQL injections. CTEs should be used instead.
+
+#5.  The ‘get_customer_balance’ function describes the business requirements for calculating the client balance. Unfortunately, not all of them are implemented in this function. Try to change function using the requirements from the comments
+Answer: get_customer_balance ignores the replacement cost fee. The next query will account for that
+
+CREATE OR REPLACE FUNCTION public.get_customer_balance(
+    p_customer_id integer, 
+    p_effective_date timestamp with time zone
+)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $function$
+/**
+ * REQUIRMENTS FROM COMMENTS:
+ * 1) RENTAL FEES FOR ALL PREVIOUS RENTALS
+ * 2) ONE DOLLAR FOR EVERY DAY OVERDUE
+ * 3) IF MORE THAN RENTAL_DURATION * 2 OVERDUE, CHARGE REPLACEMENT_COST
+ * 4) SUBTRACT ALL PAYMENTS MADE BEFORE EFFECTIVE DATE
+ */
+DECLARE
+    v_total_fees NUMERIC := 0;
+    v_payments   NUMERIC := 0;
+BEGIN
+    -- Step 1, 2, & 3: Calculate initial fees, late fees, and replacement penalties
+    SELECT SUM(
+        -- 1) Initial Rental Fee
+        f.rental_rate + 
+        
+        CASE 
+            -- Calculate days overdue (using p_effective_date if not yet returned)
+            WHEN COALESCE(r.return_date, p_effective_date) > (r.rental_date + (f.rental_duration * INTERVAL '1 day'))
+            THEN 
+                CASE 
+                    -- 3) If more than RENTAL_DURATION * 2 overdue, add REPLACEMENT_COST
+                    WHEN COALESCE(r.return_date, p_effective_date) > (r.rental_date + (f.rental_duration * 2 * INTERVAL '1 day'))
+                    THEN f.replacement_cost + 
+                         (EXTRACT(epoch FROM (COALESCE(r.return_date, p_effective_date) - (r.rental_date + (f.rental_duration * INTERVAL '1 day')))) / 86400)::INTEGER
+                    
+                    -- 2) Otherwise, just $1 per day overdue
+                    ELSE (EXTRACT(epoch FROM (COALESCE(r.return_date, p_effective_date) - (r.rental_date + (f.rental_duration * INTERVAL '1 day')))) / 86400)::INTEGER
+                END
+            ELSE 0 
+        END
+    ) INTO v_total_fees
+    FROM rental r
+    JOIN inventory i ON r.inventory_id = i.inventory_id
+    JOIN film f ON i.film_id = f.film_id
+    WHERE r.customer_id = p_customer_id
+      AND r.rental_date <= p_effective_date;
+
+    -- Step 4: Subtract all payments made before the effective date
+    SELECT COALESCE(SUM(amount), 0) INTO v_payments
+    FROM payment
+    WHERE customer_id = p_customer_id
+      AND payment_date <= p_effective_date;
+
+    RETURN COALESCE(v_total_fees, 0) - v_payments;
+END;
+$function$;
+
+#6 How do ‘group_concat’ and ‘_group_concat’ functions work and where are they used?
+Answer: those two functions are used when we need to turn rows into a list. it is used when database lists categories of movies and actors. Function consists of two parts: State Transition Function (_group_concat)
+ and the Aggregate Definition (group_concat). First takes two arguments and joins them together as a list while also handling nulls.
+SELECT CASE
+  WHEN $2 IS NULL THEN $1
+  WHEN $1 IS NULL THEN $2
+  ELSE $1 || ', ' || $2
+END
+
+ Second (group_concat) turns the results into string.
+
+CREATE OR REPLACE AGGREGATE public.group_concat(pg_catalog.text) (
+	SFUNC = _group_concat,
+	STYPE = text
+);
+
+#7 What does ‘last_updated’ function do? Where is it used?
+Answer: last_updated is a trigger function that runs in the background automatically  whenever there are changes in table
+last_updated column is used in a lot of tables such as customer, actor and so on. It is used to see when a row was inserted or updated
+
+#8 What is tmpSQL variable for in ‘rewards_report’ function? Can this function be recreated without EXECUTE statement and dynamic SQL? Why?
+Answer:  tmpSQL used for dynamic filtering in two steps. First is string construction: It builds the INSERT INTO tmpCustomer statement by concatenating variables. Second step is handling variable inputs.
+It can be used without EXECUTE, we just need to rewrite query using a standard INSERT INTO ... SELECT statement with direct variable references.
+Static SQL would decrease CPU load, increase security (since dynamic SQL is vulnerable to SQL injections) and improve readability
+
+#9 Can any function produce incorrect results? Why?
+Answer: rewards_report is hardcoded and will produce incorrect results due to chronological lock.
+get_customer_balance ignores the replacement costs and will produce incorrect balance as a result
